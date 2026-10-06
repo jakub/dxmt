@@ -150,7 +150,7 @@ struct TessMeshWorkload {
 
 int
 get_next_index(threadgroup int *out_count) {
-  return __metal_atomic_fetch_add_explicit(out_count, 1, int(memory_order_relaxed), __METAL_MEMORY_SCOPE_THREADGROUP__);
+  return __metal_atomic_fetch_add_explicit(out_count, 1, int(memory_order_relaxed), __METAL_MEMORY_SCOPE_THREADGROUP__, __METAL_MEMORY_FLAGS_NONE__);
 }
 
 template <partitioning partition>
