@@ -1084,6 +1084,209 @@ static bool texture_upload_pitch_ok(id<MTLTexture> tex, size_t width, size_t byt
   return bytes_per_row >= width * bpp;
 }
 
+/* ---- DIAG(a8-trace): where does 1-byte colour texture content go? ---------
+ * RimWorld renders no text; both its font paths use A8Unorm (maybe R8Unorm)
+ * textures. Traces every A8/R8 texture: creation, views, uploads (with a
+ * checksum of the SOURCE bytes at encode time), render-pass residency, and a
+ * GPU readback of the first 8 uploads 6 and 300 presents later. On by default
+ * in a diagnostic build; MADEIRA_A8_TRACE=0 silences it. Rate-limited. */
+uint64_t madeira_get_present_count(void);
+
+static int a8_on(void) {
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("MADEIRA_A8_TRACE");
+    on = !(e && e[0] == '0');
+  }
+  return on;
+}
+static bool a8_fmt(MTLPixelFormat f) { return f == MTLPixelFormatA8Unorm || f == MTLPixelFormatR8Unorm; }
+static bool a8_budget(_Atomic unsigned *n, unsigned first) {
+  unsigned v = atomic_fetch_add_explicit(n, 1, memory_order_relaxed) + 1;
+  return v <= first || (v & 1023) == 0;
+}
+static void a8_sum(const uint8_t *p, size_t row_bytes, size_t rows, size_t pitch,
+                   uint32_t *fnv, size_t *nz, unsigned *mx) {
+  uint32_t h = 2166136261u; size_t n = 0; unsigned m = 0;
+  for (size_t r = 0; r < rows; r++) {
+    const uint8_t *q = p + r * pitch;
+    for (size_t i = 0; i < row_bytes; i++) { h = (h ^ q[i]) * 16777619u; n += q[i] != 0; if (q[i] > m) m = q[i]; }
+  }
+  *fnv = h; *nz = n; *mx = m;
+}
+
+/* tracked A8/R8 textures and their views, for the cheap useResource check */
+#define A8_TRACKED 128
+static void *g_a8_tracked[A8_TRACKED];
+static _Atomic unsigned g_a8_ntracked;
+static os_unfair_lock g_a8_lock = OS_UNFAIR_LOCK_INIT;
+static void a8_track(id<MTLTexture> t) {
+  os_unfair_lock_lock(&g_a8_lock);
+  unsigned n = atomic_load_explicit(&g_a8_ntracked, memory_order_relaxed);
+  g_a8_tracked[n % A8_TRACKED] = (void *)t;   /* ring: newest 128 */
+  atomic_store_explicit(&g_a8_ntracked, n + 1, memory_order_relaxed);
+  os_unfair_lock_unlock(&g_a8_lock);
+}
+static bool a8_is_tracked(void *p) {
+  unsigned n = atomic_load_explicit(&g_a8_ntracked, memory_order_relaxed);
+  if (n > A8_TRACKED) n = A8_TRACKED;
+  for (unsigned i = 0; i < n; i++) if (g_a8_tracked[i] == p) return true;
+  return false;
+}
+
+/* Readback slots: the first 8 traced buffer->texture uploads plus the first 4
+ * buffer-backed (linear, DYNAMIC Map) textures, which have no upload event. */
+#define A8_RB_SLOTS 12
+static struct {
+  id<MTLTexture> tex;
+  uint32_t slice, level, x, y, w, h;
+  uint32_t src_fnv; size_t src_nz; int linear;
+  uint64_t at; int state;   /* 0 free, 1 wait early, 2 wait late, 3 done */
+} g_a8_rb[A8_RB_SLOTS];
+
+/* caller holds g_a8_lock */
+static void a8_arm_locked(id<MTLTexture> t, int first, int last, uint32_t slice, uint32_t level, uint32_t x,
+                          uint32_t y, uint32_t w, uint32_t h, uint32_t fnv, size_t nz, int linear) {
+  for (int i = first; i < last; i++) {
+    if (g_a8_rb[i].state || g_a8_rb[i].tex) continue;
+    g_a8_rb[i].tex = [t retain];
+    g_a8_rb[i].slice = slice; g_a8_rb[i].level = level; g_a8_rb[i].x = x; g_a8_rb[i].y = y;
+    g_a8_rb[i].w = w; g_a8_rb[i].h = h; g_a8_rb[i].src_fnv = fnv; g_a8_rb[i].src_nz = nz;
+    g_a8_rb[i].linear = linear; g_a8_rb[i].at = madeira_get_present_count(); g_a8_rb[i].state = 1;
+    return;
+  }
+}
+
+static void a8_trace_new_texture(id<MTLTexture> t, const struct WMTTextureInfo *info, const char *path, uint64_t bpr) {
+  if (!a8_on()) return;
+  MTLPixelFormat f = to_metal_pixel_format(info->pixel_format);
+  if (!a8_fmt(f)) return;
+  if (t) a8_track(t);
+  if (t && bpr && info->width * info->height <= (4u << 20)) {   /* linear: content arrives by CPU Map, no blit */
+    os_unfair_lock_lock(&g_a8_lock);
+    a8_arm_locked(t, 8, 12, 0, 0, 0, 0, info->width, info->height, 0, 0, 1);
+    os_unfair_lock_unlock(&g_a8_lock);
+  }
+  static _Atomic unsigned n;
+  if (!a8_budget(&n, 64)) return;
+  fprintf(stderr, "[a8-trace] new %s tex=%p fmt=%s %ux%u mips=%u arr=%u type=%u usage=0x%lx opts=0x%llx "
+                  "-> storage=%ld cpuCache=%ld compressionType=%ld linear_bpr=%llu%s\n",
+          path, (void *)t, f == MTLPixelFormatA8Unorm ? "A8" : "R8", info->width, info->height,
+          info->mipmap_level_count, info->array_length, (unsigned)info->type, (unsigned long)info->usage,
+          (unsigned long long)info->options, t ? (long)[t storageMode] : -1L, t ? (long)[t cpuCacheMode] : -1L,
+          t ? (long)[t compressionType] : -1L,
+          (unsigned long long)bpr, t ? "" : "  ** NIL TEXTURE **");
+}
+
+static void a8_trace_view(id<MTLTexture> parent, id<MTLTexture> view, const struct unixcall_mtltexture_newtextureview *p) {
+  if (!a8_on() || !a8_fmt([parent pixelFormat])) return;
+  if (view) a8_track(view);
+  static _Atomic unsigned n;
+  if (!a8_budget(&n, 64)) return;
+  MTLTextureSwizzleChannels sw = view ? [view swizzle] : MTLTextureSwizzleChannelsDefault;
+  fprintf(stderr, "[a8-trace] view parent=%p(fmt %lu usage=0x%lx) -> view=%p fmt=%lu type=%u lv=%u+%u sl=%u+%u "
+                  "swz=%u%u%u%u (in %u%u%u%u)%s\n",
+          (void *)parent, (unsigned long)[parent pixelFormat], (unsigned long)[parent usage], (void *)view,
+          (unsigned long)to_metal_pixel_format(p->format), (unsigned)p->texture_type, p->level_start, p->level_count,
+          p->slice_start, p->slice_count, sw.red, sw.green, sw.blue, sw.alpha, p->swizzle.r, p->swizzle.g,
+          p->swizzle.b, p->swizzle.a, view ? "" : "  ** NIL VIEW **");
+}
+
+
+static void a8_trace_b2t(const struct wmtcmd_blit_copy_from_buffer_to_texture *b, id<MTLTexture> dst, bool will_copy) {
+  if (!a8_on() || !a8_fmt([dst pixelFormat])) return;
+  static _Atomic unsigned n;
+  const uint8_t *base = (const uint8_t *)[(id<MTLBuffer>)b->src contents];
+  uint32_t fnv = 0; size_t nz = 0; unsigned mx = 0;
+  bool summed = false;
+  if (base && b->size.width && b->size.height &&
+      b->src_offset + (uint64_t)b->bytes_per_row * (b->size.height - 1) + b->size.width <= [(id<MTLBuffer>)b->src length]) {
+    a8_sum(base + b->src_offset, b->size.width, b->size.height, b->bytes_per_row, &fnv, &nz, &mx);
+    summed = true;
+  }
+  if (a8_budget(&n, 200))
+    fprintf(stderr, "[a8-trace] upload#%u b2t dst=%p (storage %ld) lvl=%u sl=%u org=%u,%u size=%ux%ux%u bpr=%u bpi=%u "
+                    "src=%p+%llu src_bytes: %s fnv=%08x nonzero=%zu/%zu max=%u%s\n",
+            atomic_load(&n), (void *)dst, (long)[dst storageMode], b->level, b->slice, (unsigned)b->origin.x, (unsigned)b->origin.y,
+            (unsigned)b->size.width, (unsigned)b->size.height, (unsigned)b->size.depth, b->bytes_per_row, b->bytes_per_image, (void *)b->src,
+            (unsigned long long)b->src_offset, summed ? "ok" : (base ? "OUT-OF-RANGE" : "NO-CPU-VIEW"), fnv, nz,
+            (size_t)b->size.width * (unsigned)b->size.height, mx, will_copy ? "" : "  ** DROPPED by pitch check **");
+  if (!will_copy || !summed || nz == 0 || b->size.depth != 1 || (uint64_t)b->size.width * b->size.height > (4u << 20))
+    return;
+  os_unfair_lock_lock(&g_a8_lock);
+  a8_arm_locked(dst, 0, 8, b->slice, b->level, b->origin.x, b->origin.y, b->size.width, b->size.height, fnv, nz, 0);
+  os_unfair_lock_unlock(&g_a8_lock);
+}
+
+/* Present thread only. Blocking, but runs at most 16 times per process. */
+static void a8_snapshot(int i, const char *when) {
+  static id<MTLCommandQueue> q;
+  id<MTLTexture> t = g_a8_rb[i].tex;
+  if (!q) q = [[t device] newCommandQueue];
+  size_t len = (size_t)g_a8_rb[i].w * g_a8_rb[i].h;
+  id<MTLBuffer> buf = [[t device] newBufferWithLength:len options:MTLResourceStorageModeShared];
+  memset([buf contents], 0xA5, len);   /* sentinel: survives only if the copy never ran */
+  id<MTLCommandBuffer> cb = [q commandBuffer];
+  id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+  [e copyFromTexture:t sourceSlice:g_a8_rb[i].slice sourceLevel:g_a8_rb[i].level
+        sourceOrigin:MTLOriginMake(g_a8_rb[i].x, g_a8_rb[i].y, 0)
+          sourceSize:MTLSizeMake(g_a8_rb[i].w, g_a8_rb[i].h, 1)
+            toBuffer:buf destinationOffset:0 destinationBytesPerRow:g_a8_rb[i].w
+  destinationBytesPerImage:len];
+  [e endEncoding];
+  [cb commit];
+  [cb waitUntilCompleted];
+  uint32_t fnv; size_t nz; unsigned mx;
+  a8_sum((const uint8_t *)[buf contents], len, 1, len, &fnv, &nz, &mx);
+  if (g_a8_rb[i].linear && [t buffer]) {   /* what the CPU (game's Map) sees in the backing buffer */
+    uint32_t cf; size_t cn; unsigned cm;
+    a8_sum((const uint8_t *)[[t buffer] contents] + [t bufferOffset], g_a8_rb[i].w, g_a8_rb[i].h,
+           [t bufferBytesPerRow], &cf, &cn, &cm);
+    g_a8_rb[i].src_fnv = cf; g_a8_rb[i].src_nz = cn;
+  }
+  fprintf(stderr, "[a8-trace] readback[%d]%s %s tex=%p region=%u,%u %ux%u: gpu fnv=%08x nonzero=%zu max=%u | "
+                  "uploaded fnv=%08x nonzero=%zu -> %s (cmdbuf status %ld err %s)\n",
+          i, g_a8_rb[i].linear ? " linear(cpu-view as 'uploaded')" : "", when, (void *)t, g_a8_rb[i].x, g_a8_rb[i].y, g_a8_rb[i].w, g_a8_rb[i].h, fnv, nz, mx,
+          g_a8_rb[i].src_fnv, g_a8_rb[i].src_nz,
+          fnv == g_a8_rb[i].src_fnv ? "MATCH" : (nz == 0 ? "ZERO" : "DIFFERENT"), (long)[cb status],
+          [cb error] ? [[[cb error] localizedDescription] UTF8String] : "none");
+  [buf release];
+}
+
+static void a8_rb_poll(void) {
+  if (!a8_on()) return;
+  uint64_t now = madeira_get_present_count();
+  static int armed;
+  if (!armed) {
+    armed = 1;
+    fprintf(stderr, "[a8-trace] armed: readback poll runs on presentDrawable, present_count=%llu "
+                    "(MADEIRA_A8_TRACE=0 disables)\n", (unsigned long long)now);
+  }
+  for (int i = 0; i < A8_RB_SLOTS; i++) {
+    os_unfair_lock_lock(&g_a8_lock);
+    int st = g_a8_rb[i].state; uint64_t at = g_a8_rb[i].at;
+    os_unfair_lock_unlock(&g_a8_lock);
+    if (st == 1 && now >= at + 6) {
+      a8_snapshot(i, "early(+6 presents)");
+      os_unfair_lock_lock(&g_a8_lock); g_a8_rb[i].state = 2; g_a8_rb[i].at = now; os_unfair_lock_unlock(&g_a8_lock);
+    } else if (st == 2 && now >= at + 300) {
+      a8_snapshot(i, "late(+300 presents)");
+      os_unfair_lock_lock(&g_a8_lock);
+      [g_a8_rb[i].tex release]; g_a8_rb[i].tex = nil; g_a8_rb[i].state = 3;   /* slot stays used */
+      os_unfair_lock_unlock(&g_a8_lock);
+    }
+  }
+}
+
+static void a8_trace_use(void *res, const char *where) {
+  if (!a8_on() || !a8_is_tracked(res)) return;
+  static _Atomic unsigned n;
+  if (a8_budget(&n, 32))
+    fprintf(stderr, "[a8-trace] use#%u %s useResource %p (A8/R8 texture is resident in a pass)\n",
+            atomic_load(&n), where, res);
+}
+/* ---- end DIAG(a8-trace) --------------------------------------------------- */
+
 /* madeira_d3d12 copies ONE plane of a combined depth-stencil texture from a
  * buffer and names it in reserved[0] (1 = depth, 2 = stencil, the
  * MTLBlitOption values); Metal leaves a buffer->texture copy into such a
@@ -1154,6 +1357,7 @@ _MTLDevice_newTexture(void *obj) {
   fill_texture_descriptor(desc, info);
 
   id<MTLTexture> ret = [device newTextureWithDescriptor:desc];
+  a8_trace_new_texture(ret, info, "device", 0);   /* DIAG(a8-trace) */
   params->ret = (obj_handle_t)ret;
   info->gpu_resource_id = [ret gpuResourceID]._impl;
   info->mach_port = 0;
@@ -1190,6 +1394,7 @@ _MTLBuffer_newTexture(void *obj) {
 
   wmt_stale_check(buffer, "buffer newTexture view");   /* ml1156 */
   id<MTLTexture> ret = [buffer newTextureWithDescriptor:desc offset:params->offset bytesPerRow:params->bytes_per_row];
+  a8_trace_new_texture(ret, info, "linear", params->bytes_per_row);   /* DIAG(a8-trace) */
   params->ret = (obj_handle_t)ret;
   info->gpu_resource_id = [ret gpuResourceID]._impl;
   info->mach_port = 0;
@@ -1256,6 +1461,7 @@ _MTLTexture_newTextureView(void *obj) {
                              levels:NSMakeRange(params->level_start, params->level_count)
                              slices:NSMakeRange(params->slice_start, params->slice_count)
                             swizzle:to_metal_swizzle(params->swizzle, params->format)];
+  a8_trace_view(texture, ret, params);   /* DIAG(a8-trace) */
   params->ret = (obj_handle_t)ret;
   params->gpu_resource_id = [ret gpuResourceID]._impl;
   return STATUS_SUCCESS;
@@ -2110,6 +2316,8 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
       struct wmtcmd_blit_copy_from_buffer_to_texture *body = (struct wmtcmd_blit_copy_from_buffer_to_texture *)next;
       id<MTLTexture> dst = (id<MTLTexture>)body->dst;
       MTLBlitOption plane = b2t_plane_option(dst, body->reserved[0]);
+      /* DIAG(a8-trace) */
+      a8_trace_b2t(body, dst, plane || texture_upload_pitch_ok(dst, body->size.width, body->bytes_per_row));
       /* iOS-Madeira: skip BC-pitch uploads to remapped RGBA8 textures. Not for
        * a plane copy: one plane is 4 or 1 bytes per pixel, not the combined
        * format's (as the texture->buffer case below, ml1102). */
@@ -2152,6 +2360,14 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     }
     case WMTBlitCommandCopyFromTextureToTexture: {
       struct wmtcmd_blit_copy_from_texture_to_texture *body = (struct wmtcmd_blit_copy_from_texture_to_texture *)next;
+      if (a8_on() && a8_fmt([(id<MTLTexture>)body->dst pixelFormat])) {   /* DIAG(a8-trace) */
+        static _Atomic unsigned t2t_n;
+        if (a8_budget(&t2t_n, 32))
+          fprintf(stderr, "[a8-trace] t2t src=%p(fmt %lu) -> dst=%p lvl=%u sl=%u org=%u,%u size=%ux%u\n",
+                  (void *)body->src, (unsigned long)[(id<MTLTexture>)body->src pixelFormat], (void *)body->dst,
+                  body->dst_level, body->dst_slice, (unsigned)body->dst_origin.x, (unsigned)body->dst_origin.y,
+                  (unsigned)body->src_size.width, (unsigned)body->src_size.height);
+      }
       [encoder copyFromTexture:(id<MTLTexture>)body->src
                    sourceSlice:body->src_slice
                    sourceLevel:body->src_level
@@ -2438,6 +2654,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandUseResource: {
       struct wmtcmd_render_useresource *body = (struct wmtcmd_render_useresource *)next;
       wmt_stale_check(body->resource, "render useResource");
+      a8_trace_use((void *)body->resource, "render");   /* DIAG(a8-trace) */
       [encoder useResource:(id<MTLResource>)body->resource
                      usage:(MTLResourceUsage)body->usage
                     stages:(MTLRenderStages)body->stages];
@@ -2864,6 +3081,16 @@ _MTLTexture_replaceRegion(void *obj) {
     return STATUS_SUCCESS;
   }
   id<MTLTexture> tex = (id<MTLTexture>)params->texture;
+  if (a8_on() && a8_fmt([tex pixelFormat]) && params->data.ptr) {   /* DIAG(a8-trace) */
+    static _Atomic unsigned rr_n;
+    uint32_t fnv; size_t nz; unsigned mx;
+    a8_sum((const uint8_t *)params->data.ptr, params->size.width, params->size.height, params->bytes_per_row,
+           &fnv, &nz, &mx);
+    if (a8_budget(&rr_n, 64))
+      fprintf(stderr, "[a8-trace] replaceRegion tex=%p lvl=%llu org=%u,%u size=%ux%u bpr=%llu fnv=%08x nonzero=%zu max=%u\n",
+              (void *)tex, (unsigned long long)params->level, (unsigned)params->origin.x, (unsigned)params->origin.y,
+              (unsigned)params->size.width, (unsigned)params->size.height, (unsigned long long)params->bytes_per_row, fnv, nz, mx);
+  }
   /* iOS-Madeira: skip BC-pitch uploads to remapped RGBA8 textures. */
   if (!texture_upload_pitch_ok(tex, params->size.width, params->bytes_per_row))
     return STATUS_SUCCESS;
@@ -3386,6 +3613,7 @@ _MTLCommandBuffer_presentDrawable(void *obj) {
     wmtr_call(RM_OP_PRESENT_DRAWABLE, &a, sizeof a, 0, 0, 0);
     return STATUS_SUCCESS;
   }
+  a8_rb_poll();   /* DIAG(a8-trace) */
   int mode = g_madeira_vsync_mode;
   /* ml1050: this call IS the frame boundary on the encode thread. */
   if (madeira_frame_hooks_on())
